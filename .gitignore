@@ -1,0 +1,9 @@
+.vscode/
+.github/
+
+# 过程性文件
+build/
+logs/
+manual_output/
+records/
+assets/chessboard_calib/

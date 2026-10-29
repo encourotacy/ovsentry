@@ -1,0 +1,308 @@
+#include "target.hpp"
+
+#include <numeric>
+
+#include "tools/logger.hpp"
+#include "tools/math_tools.hpp"
+
+namespace {
+//--- 前哨站属性参数 ---
+constexpr double OUTPOST_RULE_SPEED = 0.8 * CV_PI;  // 前哨站规定转速，rad/s
+constexpr double OUTPOST_LAYER_SPACING = 0.1;       //前哨站上下层差，m
+//--- Q矩阵相关参数 ---
+constexpr double NORMAL_TRANSLATION_PROCESS_NOISE = 100.0;
+constexpr double NORMAL_YAW_PROCESS_NOISE = 400.0;
+constexpr double OUTPOST_XY_PROCESS_NOISE = 640.0;
+constexpr double OUTPOST_Z_PROCESS_NOISE = 40.0;
+constexpr double OUTPOST_YAW_PROCESS_NOISE = 4.0;
+}  // namespace
+
+namespace auto_aim {
+//=== 初始化 ===
+Target::Target(const Armor& armor, std::chrono::steady_clock::time_point t, double radius,
+               int armor_num, Eigen::VectorXd P0_dig)
+    : name(armor.name_), t_(t), armor_num_(armor_num), update_count_(0) {
+    const Eigen::VectorXd& xyz = armor.xyz_in_world_;
+    const Eigen::VectorXd& ypr = armor.ypr_in_world_;
+
+    // 旋转中心的坐标
+    auto center_x = xyz[0] + radius * std::cos(ypr[0]);
+    auto center_y = xyz[1] + radius * std::sin(ypr[0]);
+    auto center_z = xyz[2];
+
+    // x vx y vy z vz a w r l h
+    // a: angle
+    // w: angular velocity
+    // l: r2 - r1
+    // h: z2 - z1
+    Eigen::VectorXd x0{{
+        center_x,  // x: 旋转中心坐标 x
+        0,         // vx: 旋转中心x向速度
+        center_y,  // y: 旋转中心坐标 y
+        0,         // vy: 旋转中心y向速度 vy
+        center_z,  // z: 旋转中心坐标 z
+        0,         // vz: 旋转中心z向速度 vz
+        ypr[0],    // a: 第一块装甲板相对世界坐标系的偏航角
+        0,         // w: 旋转角速度
+        radius,    // r: 装甲板所在半径
+        0,         // l: 长方形中长轴与短轴的差
+        0          // h: 高度偏移
+    }};
+    Eigen::MatrixXd P0 = P0_dig.asDiagonal();
+
+    // 防止夹角求和出现异常值
+    auto x_add = [](const Eigen::VectorXd& a, const Eigen::VectorXd& b) -> Eigen::VectorXd {
+        Eigen::VectorXd c = a + b;
+        c[6] = tools::limit_rad(c[6]);
+        return c;
+    };
+
+    auto z_subtract = [](const Eigen::VectorXd& a, const Eigen::VectorXd& b) -> Eigen::VectorXd {
+        Eigen::VectorXd c = a - b;
+        c[0] = tools::limit_rad(c[0]);
+        c[1] = tools::limit_rad(c[1]);
+        c[3] = tools::limit_rad(c[3]);
+        return c;
+    };
+
+    ekf_ = tools::ExtendedKalmanFilter(x0, P0, x_add,
+                                       z_subtract);  //初始化滤波器（状态量、预测量协方差）
+}
+
+//=== 主程序 ===
+void Target::predict(std::chrono::steady_clock::time_point t) {
+    auto dt = tools::delta_time(t, t_);
+    predict(dt);
+    t_ = t;
+}
+
+void Target::predict(double dt) {
+    // 状态转移矩阵
+    // clang-format off
+    Eigen::MatrixXd F{
+        {1, dt,  0,  0,  0,  0,  0,  0,  0,  0,  0},
+        {0,  1,  0,  0,  0,  0,  0,  0,  0,  0,  0},
+        {0,  0,  1, dt,  0,  0,  0,  0,  0,  0,  0},
+        {0,  0,  0,  1,  0,  0,  0,  0,  0,  0,  0},
+        {0,  0,  0,  0,  1, dt,  0,  0,  0,  0,  0},
+        {0,  0,  0,  0,  0,  1,  0,  0,  0,  0,  0},
+        {0,  0,  0,  0,  0,  0,  1, dt,  0,  0,  0},
+        {0,  0,  0,  0,  0,  0,  0,  1,  0,  0,  0},
+        {0,  0,  0,  0,  0,  0,  0,  0,  1,  0,  0},
+        {0,  0,  0,  0,  0,  0,  0,  0,  0,  1,  0},
+        {0,  0,  0,  0,  0,  0,  0,  0,  0,  0,  1}
+    };
+    // clang-format on
+
+    // Piecewise White Noise Model
+    // https://github.com/rlabbe/Kalman-and-Bayesian-Filters-in-Python/blob/master/07-Kalman-Filter-Math.ipynb
+    auto a = dt * dt * dt * dt / 4;
+    auto b = dt * dt * dt / 2;
+    auto c = dt * dt;
+    double q_xy, q_z, q_yaw;
+    if (name == ArmorName::OUTPOST && outpost_Q_optimize_) {
+        q_xy = OUTPOST_XY_PROCESS_NOISE;    // 前哨站xy方向加速度方差
+        q_z = OUTPOST_Z_PROCESS_NOISE;      // 前哨站z方向加速度方差
+        q_yaw = OUTPOST_YAW_PROCESS_NOISE;  // 前哨站角加速度方差
+    } else {
+        q_xy = NORMAL_TRANSLATION_PROCESS_NOISE;  // xy方向加速度方差
+        q_z = NORMAL_TRANSLATION_PROCESS_NOISE;   // z方向加速度方差
+        q_yaw = NORMAL_YAW_PROCESS_NOISE;         // 角加速度方差
+    }
+
+    // 预测过程噪声偏差的方差
+    // clang-format off
+    Eigen::MatrixXd Q{
+        {a * q_xy, b * q_xy,        0,        0,       0,       0,      0,            0, 0, 0, 0},
+        {b * q_xy, c * q_xy,        0,        0,       0,       0,      0,            0, 0, 0, 0},
+        {       0,        0, a * q_xy, b * q_xy,       0,       0,      0,            0, 0, 0, 0},
+        {       0,        0, b * q_xy, c * q_xy,       0,       0,      0,            0, 0, 0, 0},
+        {       0,        0,        0,        0, a * q_z, b * q_z,      0,            0, 0, 0, 0},
+        {       0,        0,        0,        0, b * q_z, c * q_z,      0,            0, 0, 0, 0},
+        {       0,        0,        0,        0,       0,       0, a * q_yaw, b * q_yaw, 0, 0, 0},
+        {       0,        0,        0,        0,       0,       0, b * q_yaw, c * q_yaw, 0, 0, 0},
+        {       0,        0,        0,        0,       0,       0,      0,            0, 0, 0, 0},
+        {       0,        0,        0,        0,       0,       0,      0,            0, 0, 0, 0},
+        {       0,        0,        0,        0,       0,       0,      0,            0, 0, 0, 0}
+    };
+    // clang-format on
+
+    // 防止夹角求和出现异常值
+    auto f = [&](const Eigen::VectorXd& x) -> Eigen::VectorXd {
+        Eigen::VectorXd x_prior = F * x;
+        x_prior[6] = tools::limit_rad(x_prior[6]);
+        return x_prior;
+    };
+
+    // 前哨站转速特判，修正其速度
+    if (this->convergened() && this->name == ArmorName::OUTPOST && std::abs(this->ekf_.x[7]) > 3.2)
+        this->ekf_.x[7] = this->ekf_.x[7] > 0 ? OUTPOST_RULE_SPEED : -OUTPOST_RULE_SPEED;
+
+    ekf_.predict(F, Q, f);
+}
+
+void Target::update(const Armor& armor) {
+    int id = match_id(armor);
+
+    update_count_++;
+
+    // 计算测量噪声协方差矩阵 R
+    auto center_yaw = std::atan2(armor.xyz_in_world_[1], armor.xyz_in_world_[0]);
+    auto delta_angle = tools::limit_rad(armor.ypr_in_world_[0] - center_yaw);
+
+    Eigen::VectorXd R_dig;
+    if (name == ArmorName::OUTPOST && outpost_R_optimize_) {
+        R_dig = Eigen::VectorXd{{0.02, 0.02, std::log(std::abs(delta_angle) + 1) + 3,
+                                 std::log(std::abs(armor.ypd_in_world_[2]) + 1) / 200 + 0.5}};
+    } else {
+        R_dig = Eigen::VectorXd{{4e-3, 4e-3, std::log(std::abs(delta_angle) + 1) + 1,
+                                 std::log(std::abs(armor.ypd_in_world_[2]) + 1) / 200 + 9e-2}};
+    }
+    Eigen::MatrixXd R = R_dig.asDiagonal();
+
+    // 非线性转换函数 z = h(x)
+    auto h = [&](const Eigen::VectorXd& x) -> Eigen::Vector4d {
+        Eigen::VectorXd xyz = speculate_armor_xyz(x, id);
+        Eigen::VectorXd ypd = tools::xyz2ypd(xyz);
+        auto angle = tools::limit_rad(x[6] + id * 2 * CV_PI / armor_num_);
+        return {ypd[0], ypd[1], ypd[2], angle};
+    };
+    // z 是观测向量。共4个值：
+    // yaw      : 球面坐标系的yaw
+    // pitch    : 球面坐标系的yaw
+    // distance : 球面坐标系的距离
+    // angle    : id号装甲板的相对于世界坐标系的偏航角
+
+    // 转换函数的雅可比矩阵
+    Eigen::MatrixXd H = h_jacobian(ekf_.x, id);
+
+    const Eigen::VectorXd& ypd = armor.ypd_in_world_;
+    const Eigen::VectorXd& ypr = armor.ypr_in_world_;
+    Eigen::VectorXd z{{ypd[0], ypd[1], ypd[2], ypr[0]}};  //获得观测量
+
+    ekf_.update(z, H, R, h);
+}
+
+//=== 查询数据 ===
+bool Target::diverged() const {
+    auto r_ok = ekf_.x[8] > 0.05 && ekf_.x[8] < 0.5;
+    auto l_ok = ekf_.x[8] + ekf_.x[9] > 0.05 && ekf_.x[8] + ekf_.x[9] < 0.5;
+
+    if (r_ok && l_ok) return false;
+
+    tools::logger()->debug("[Target] r={:.3f}, l={:.3f}", ekf_.x[8], ekf_.x[9]);
+    return true;
+}
+
+bool Target::convergened() {
+    if (this->name != ArmorName::OUTPOST && update_count_ > 3 && !this->diverged()) {
+        return true;
+    }
+
+    //前哨站特殊判断
+    if (this->name == ArmorName::OUTPOST && update_count_ > 10 && !this->diverged()) {
+        return true;
+    }
+
+    return false;
+}
+
+Eigen::VectorXd Target::ekf_x() const { return ekf_.x; }
+
+const tools::ExtendedKalmanFilter& Target::ekf() const { return ekf_; }
+
+std::vector<Eigen::Vector4d> Target::armor_xyza_list() const {
+    std::vector<Eigen::Vector4d> xyza_list;
+
+    for (int i = 0; i < armor_num_; i++) {
+        auto angle = tools::limit_rad(ekf_.x[6] + i * 2 * CV_PI / armor_num_);
+        Eigen::Vector3d xyz = speculate_armor_xyz(ekf_.x, i);
+        xyza_list.push_back({xyz[0], xyz[1], xyz[2], angle});
+    }
+    return xyza_list;
+}
+
+//=== 工具函数 ===
+int Target::match_id(const Armor& armor) {
+    const std::vector<Eigen::Vector4d>& xyza_list = armor_xyza_list();
+    std::vector<std::pair<Eigen::Vector4d, int>> xyza_i_list;
+    for (int i = 0; i < armor_num_; i++) {
+        xyza_i_list.push_back({xyza_list[i], i});
+    }
+    std::sort(
+        xyza_i_list.begin(), xyza_i_list.end(),
+        [](const std::pair<Eigen::Vector4d, int>& a, const std::pair<Eigen::Vector4d, int>& b) {
+            Eigen::Vector3d ypd1 = tools::xyz2ypd(a.first.head(3));
+            Eigen::Vector3d ypd2 = tools::xyz2ypd(b.first.head(3));
+            return ypd1[2] < ypd2[2];
+        });
+
+    // 匹配装甲板
+    int id = 0;
+    auto min_angle_error = 1e10;
+    for (int i = 0; i < 3; i++) {
+        const auto& xyza = xyza_i_list[i].first;
+        Eigen::Vector3d ypd = tools::xyz2ypd(xyza.head(3));
+        auto angle_error = std::abs(tools::limit_rad(armor.ypr_in_world_[0] - xyza[3])) +
+                           std::abs(tools::limit_rad(armor.ypd_in_world_[0] - ypd[0]));
+
+        if (std::abs(angle_error) < std::abs(min_angle_error)) {
+            id = xyza_i_list[i].second;
+            min_angle_error = angle_error;
+        }
+    }
+    return id;
+}
+
+Eigen::Vector3d Target::speculate_armor_xyz(const Eigen::VectorXd& x, int id) const {
+    auto angle = tools::limit_rad(x[6] + id * 2 * CV_PI / armor_num_);
+
+    auto use_l_h = (armor_num_ == 4) && (id == 1 || id == 3);  // 判断是否需要使用长短轴和高低差
+
+    auto r = (use_l_h) ? x[8] + x[9] : x[8];
+    auto armor_x = x[0] - r * std::cos(angle);
+    auto armor_y = x[2] - r * std::sin(angle);
+    auto armor_z = (use_l_h) ? x[4] + x[10] : x[4];
+
+    return {armor_x, armor_y, armor_z};
+}
+
+Eigen::MatrixXd Target::h_jacobian(const Eigen::VectorXd& x, int id) const {
+    auto angle = tools::limit_rad(x[6] + id * 2 * CV_PI / armor_num_);
+    auto use_l_h = (armor_num_ == 4) && (id == 1 || id == 3);
+
+    auto r = (use_l_h) ? x[8] + x[9] : x[8];
+    auto dx_da = r * std::sin(angle);
+    auto dy_da = -r * std::cos(angle);
+
+    auto dx_dr = -std::cos(angle);
+    auto dy_dr = -std::sin(angle);
+    auto dx_dl = (use_l_h) ? -std::cos(angle) : 0.0;
+    auto dy_dl = (use_l_h) ? -std::sin(angle) : 0.0;
+
+    auto dz_dh = (use_l_h) ? 1.0 : 0.0;
+
+    // clang-format off
+    Eigen::MatrixXd H_armor_xyza{
+        {1, 0, 0, 0, 0, 0, dx_da, 0, dx_dr, dx_dl,     0},
+        {0, 0, 1, 0, 0, 0, dy_da, 0, dy_dr, dy_dl,     0},
+        {0, 0, 0, 0, 1, 0,     0, 0,     0,     0, dz_dh},
+        {0, 0, 0, 0, 0, 0,     1, 0,     0,     0,     0}
+    };
+    // clang-format on
+
+    Eigen::VectorXd armor_xyz = speculate_armor_xyz(x, id);
+    Eigen::MatrixXd H_armor_ypd = tools::xyz2ypd_jacobian(armor_xyz);
+    // clang-format off
+    Eigen::MatrixXd H_armor_ypda{
+        {H_armor_ypd(0, 0), H_armor_ypd(0, 1), H_armor_ypd(0, 2), 0},
+        {H_armor_ypd(1, 0), H_armor_ypd(1, 1), H_armor_ypd(1, 2), 0},
+        {H_armor_ypd(2, 0), H_armor_ypd(2, 1), H_armor_ypd(2, 2), 0},
+        {                0,                 0,                 0, 1}
+    };
+    // clang-format on
+
+    return H_armor_ypda * H_armor_xyza;
+}
+
+}  // namespace auto_aim

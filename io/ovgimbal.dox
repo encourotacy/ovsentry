@@ -1,0 +1,208 @@
+/** @file ovgimbal.dox
+ *  @brief OVGimbal 云台通信模块的 Doxygen 文档。
+ */
+
+/** @namespace io
+ *  @brief 硬件通信相关功能的命名空间。
+ *  
+ *  包含了相机类、云台类、串口和一些工业相机接口文件
+ */
+
+/** @struct io::OVGimbalState
+ *  @brief 云台状态快照。
+ *
+ *  该结构体用于存储某一时刻云台的各种状态量与弹速。
+ */
+
+/** @enum io::AutoAimMode
+ *  @brief 自瞄模式。
+ *
+ *  该枚举由电控发送的模式字节解析得到。
+ */
+
+/** @class io::OVGimbal
+ *  @brief 云台通信类，<b>负责与C板通过串口通信</b>。
+ *  @details 主要负责以下功能 >>
+ *           - 接收数据：接收来自C板的数据，包含<b>IMU四元数、云台状态等</b>。
+ *             - 对于IMU的四元数，还需要进行球面插值计算以获取给定时刻的四元数。
+ *           - 数据访问：主程序可以从这个类里<b>读取当前的云台状态</b>。
+ *           - 发送数据：向C板发送<b>指令数据</b>。
+ *  @warning 由于弹速闭环设计，电控发送的弹速一直是0！程序中做了处理，使得<b>弹速保持为默认值</b>。    
+ */
+
+/** @fn io::OVGimbal::OVGimbal(const std::string & config_path)
+ *  @brief 构造 OVGimbal 对象，加载配置并初始化串口通信。
+ *  @details
+ *  构造函数读取了以下参数：
+ *  - `default_bullet_speed`：<b>默认弹速</b>，默认值为 23.0，即步兵小弹丸通常的弹速；
+ *  - `timing.offset`：<b>串口姿态固定时间补偿</b>，单位为秒，默认 -0.001 s；
+ *
+ *  以及做了以下操作：
+ *  - 将时间补偿转换为微秒并保存到 `imu_query_offset_`；
+ *  - 打开 `/dev/ttyACM0`，设置波特率 115200、超时 1000 ms；
+ *  - 启动接收线程 `receiving_date()`；
+ *  - 尝试等待首批 IMU 数据。若成功，则初始化滑动窗口；若超时，则使用单位四元数和最新可用数据作为回退。
+ *
+ *  @param config_path YAML 配置文件路径。
+ *
+ *  @throws std::exception 串口打开失败时抛出。
+ */
+
+/** @fn io::OVGimbal::~OVGimbal()
+ *
+ *  @details
+ *  设置退出标志 `quit_`，等待接收线程结束，然后关闭串口。
+ */
+
+/** @fn void io::OVGimbal::send(const io::Command & command)
+ *  @brief 使用 io::Command 发送云台控制帧。
+ *
+ *  @details
+ *  通信协议（即发送给电控的frame数据格式）如下：
+ *  | 字段               | 长度(byte) | 内容        | 说明 |
+ *  | ----------------- | ---------- | ----------- | --- |
+ *  | header            | 1          | 0xAA        | 字节头，用于识别数据段类型 |
+ *  | length            | 1          | 自动计算    | 数据段的长度 |
+ *  | cmd_id            | 1          | 0x81        | |
+ *  | pitch_tx          | 4          | 来自command | pitch角值，=-command.pitch |
+ *  | yaw_tx            | 4          | 来自command | yaw角值 |
+ *  | fire_byte         | 1          | 来自command | 是否开火 |
+ *  | yaw_vel_tx        | 4          | 0           | yaw角速度 |
+ *  | yaw_acc_tx        | 4          | 0           | yaw角加速度 |
+ *  | pitch_vel_tx      | 4          | 0           | pitch角速度 |
+ *  | pitch_acc_tx      | 4          | 0           | pitch角加速度 |
+ *  | armor_name_num_tx | 1          | 来自command | 瞄准目标的类型，1->英雄，2->工程...，5->哨兵|
+ *
+ *  @param command 控制命令，详见结构体 io::Command 。
+ *  
+ *  @note pitch_tx = -command.pitch
+ *  @note 当 `is_receiving_data_` 为 false 时视为串口断连，函数直接返回，不执行串口写入。
+ *  @note 串口写入失败时仅记录警告日志，不抛出异常。
+ */
+
+/** @fn void io::OVGimbal::send(const io::MPCCommand & mpc_command)
+ *  @brief 使用 io::MPCCommand 发送云台控制帧。
+ *
+ *  @details
+ *  通信协议（即发送给电控的frame数据格式）如下：
+ *  | 字段               | 长度(byte) | 内容        | 说明 |
+ *  | ----------------- | ---------- | ----------- | --- |
+ *  | header            | 1          | 0xAA        | 字节头，用于识别数据段类型 |
+ *  | length            | 1          | 自动计算    | 数据段的长度 |
+ *  | cmd_id            | 1          | 0x81        | |
+ *  | pitch_tx          | 4          | 来自command | pitch角值 |
+ *  | yaw_tx            | 4          | 来自command | yaw角值 |
+ *  | fire_byte         | 1          | 来自command | 是否开火 |
+ *  | yaw_vel_tx        | 4          | 来自command | yaw角速度 |
+ *  | yaw_acc_tx        | 4          | 来自command | yaw角加速度 |
+ *  | pitch_vel_tx      | 4          | 来自command | pitch角速度 |
+ *  | pitch_acc_tx      | 4          | 来自command | pitch角加速度 |
+ *  | armor_name_num_tx | 1          | 来自command | 瞄准目标的类型，1->英雄，2->工程...，5->哨兵|
+ *
+ *  @param mpc_command 控制命令，详见结构体 io::MPCCommand 。
+ *  
+ *  @note 发送时 pitch、pitch_vel、pitch_acc <b>取负</b>。
+ *  @note 当 `is_receiving_data_` 为 false 时视为串口断连，函数直接返回，不执行串口写入。
+ *  @note 串口写入失败时仅记录警告日志，不抛出异常。
+ */
+
+/** @fn void io::OVGimbal::send(bool control, bool fire, float yaw, float pitch, float yaw_vel, float yaw_acc, float pitch_vel, float pitch_acc, uint8_t armor_name_num)
+ *
+ *  @details0
+ *  通信协议详见其他 send 函数
+ *
+ *  @param control 控制使能标志。当前实现中未使用该参数。
+ *  @param fire 是否开火。
+ *  @param yaw 目标 yaw。
+ *  @param pitch 目标 pitch。
+ *  @param yaw_vel yaw 角速度。
+ *  @param yaw_acc yaw 角加速度。
+ *  @param pitch_vel pitch 角速度。
+ *  @param pitch_acc pitch 角加速度。
+ *  @param armor_name_num 装甲板编号或名称编号，默认值为 0。
+ *
+ *  @note 发送时 pitch、pitch_vel、pitch_acc <b>取负</b>。
+ *  @note 当 `is_receiving_data_` 为 false 时视为串口断连，函数直接返回，不执行串口写入。
+ *  @note 串口写入失败时仅记录警告日志，不抛出异常。
+ */
+
+/** @fn Eigen::Quaterniond io::OVGimbal::q_at(std::chrono::steady_clock::time_point image_timestamp)
+ *  @brief 获取指定图像时间戳对应的云台 IMU 姿态四元数。
+ *
+ *  @details
+ *  由于图像时间戳与串口 IMU 数据到达时间不一定相同，本函数会在内部维护的
+ *  `data_prev_`、`data_ahead_`、`data_behind_` 滑动窗口中进行球面线性插值（SLERP）。
+ *
+ *  查询时间会先加上 `imu_query_offset_` 作为固定时间补偿。若尚未接收到数据，返回单位四元数。
+ *  若目标时间早于当前窗口，则尽可能使用已有窗口数据插值或返回最近可用姿态。
+ *  若目标时间晚于当前窗口，则从队列中继续取数据并推进滑动窗口。
+ *  若队列读取失败，则尝试使用 `latest_data_` 与 `data_ahead_` 插值，否则返回 `data_ahead_`。
+ *
+ *  @param image_timestamp 图像采集时刻的 `std::chrono::steady_clock` 时间戳。
+ *
+ *  @return 该时刻估计的云台姿态四元数，返回值已归一化。
+ *
+ *  @note 若尚未接收 IMU 数据，返回 `Eigen::Quaterniond::Identity()`。
+ */
+
+/** @fn AutoAimMode io::OVGimbal::mode() const
+ *  @brief 获取当前自瞄模式。
+ *
+ *  @return 根据 `mode_byte_` 映射得到的 AutoAimMode。
+ *
+ *  @details
+ *  映射关系与枚举类 AutoAimMode 中一致。
+ */
+
+/** @fn std::string io::OVGimbal::mode_name() const
+ *  @brief 获取当前自瞄模式的字符串名称。
+ *
+ *  @return 模式名称字符串。
+ *
+ *  @details
+ *  映射关系与枚举类 AutoAimMode 中一致，但是返回其名称的字符串。
+ */
+
+/** @fn OVGimbalState io::OVGimbal::state() const
+ *  @brief 获取云台状态快照。
+ *
+ *  @return 组织为 OVGimbalState 的云台状态快照。
+ */
+
+/** @fn bool io::OVGimbal::has_imu() const
+ *  @brief 判断是否已正常接收到 IMU/电控数据。
+ *
+ *  @return 若 `is_receiving_data_` 为 true，返回 true；否则返回 false。
+ */
+
+/** @fn double io::OVGimbal::offset_ms() const
+ *  @brief 获取 IMU 查询时间补偿。
+ *
+ *  @return `imu_query_offset_` 的毫秒值。
+ *
+ *  @note 该补偿由配置文件中的 `timing.offset` 设置，默认为 -1.0 ms。
+ */
+
+/** @fn double io::OVGimbal::bullet_speed() const
+ *  @brief 获取当前弹速。
+ *
+ *  @return 当前保存的弹速，单位为 m/s。
+ *
+ *  @warning 由于弹速闭环设计，电控发送的弹速一直是0！程序中做了处理，使得弹速一直为默认弹速。
+ */
+
+/** @fn uint8_t io::OVGimbal::mode_byte() const
+ *  @brief 获取原始模式字节。
+ *
+ *  @return 最近一次有效数据帧中的模式字节。
+ *
+ *  @note 该值未经 AutoAimMode 映射，可用于调试或获取原始电控状态。
+ */
+
+/** @fn uint8_t io::OVGimbal::invincibility() const
+ *  @brief 获取敌方无敌状态位。
+ *
+ *  @return 8 位无敌状态数据。
+ *
+ *  @note 每一位通常表示一种机器人是否处于无敌状态，第1~5位分别表示：英雄、工程、3号步兵，4号步兵、哨兵。
+ */
