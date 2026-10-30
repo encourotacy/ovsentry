@@ -1,6 +1,7 @@
 #include <fmt/core.h>
 
 #include <chrono>
+#include <cmath>
 #include <opencv2/opencv.hpp>
 #include <optional>
 #include <string>
@@ -133,6 +134,22 @@ int main(int argc, char* argv[]) {
                 std::optional<auto_aim::Target> target_for_plan =
                     targets.empty() ? std::nullopt : std::make_optional(targets.front());
                 command = planner.plan(target_for_plan, gimbal.bullet_speed());
+                command.small_yaw = command.yaw;
+                command.big_yaw = command.yaw;
+                if (command.control && !targets.empty()) {
+                    const auto& target = targets.front();
+                    const auto ekf_x = target.ekf_x();
+                    command.vx = ekf_x[1];
+                    command.vy = ekf_x[3];
+                    command.distance = std::hypot(ekf_x[0], ekf_x[2]);
+                    if (target.name == auto_aim::ArmorName::OUTPOST) {
+                        command.big_yaw = gimbal_state.big_yaw;
+                    } else {
+                        const double target_yaw = std::atan2(ekf_x[2], ekf_x[0]);
+                        const double yaw_error = tools::limit_rad(target_yaw - gimbal_state.big_yaw);
+                        command.big_yaw = gimbal_state.big_yaw + yaw_error;
+                    }
+                }
                 command.rad2degree();
 
                 gimbal.send(command);

@@ -209,8 +209,8 @@ void ROS2Gimbal::send(const io::Command& c) {
 }
 
 void ROS2Gimbal::send(const io::MPCCommand& c) {
-    send(c.control, c.shoot, c.big_yaw, c.small_yaw, c.pitch, c.yaw_vel, c.yaw_acc, c.pitch_vel,
-         c.pitch_acc, c.armor_name_num, 0.0, 0.0, 0.0);
+    send(c.control, c.shoot, c.big_yaw, c.small_yaw, c.pitch, c.yaw_vel, c.pitch_vel, c.yaw_acc,
+         c.pitch_acc, c.armor_name_num, c.vx, c.vy, c.distance);
 }
 
 void ROS2Gimbal::send(bool control, bool fire, double big_yaw, double small_yaw, double pitch,

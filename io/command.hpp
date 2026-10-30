@@ -42,6 +42,9 @@ struct MPCCommand {
 
     double big_yaw;    ///< 大 yaw，部分车型使用
     double small_yaw;  ///< 小 yaw，部分车型使用
+    double vx = 0;     ///< 目标 x 方向速度，单位为 m/s
+    double vy = 0;     ///< 目标 y 方向速度，单位为 m/s
+    double distance = 0;  ///< 目标水平距离，单位为 m
 
     void rad2degree() {  ///< 弧度转角度
         yaw *= 57.3;
