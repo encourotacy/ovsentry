@@ -108,16 +108,13 @@ int main(int argc, char* argv[]) {
             prev_lost = lost;
 
             if (lost) {
-                const auto ignore_mask = armor_ignore.ignore_ids();
+                const auto ignore = armor_ignore.ignored();
                 const auto steer = omni.update(
                     gimbal_state.big_yaw,
                     [&](std::chrono::steady_clock::time_point t) {
                         return gimbal.big_yaw_at_image(t);
                     },
-                    [&](uint8_t id) {
-                        return id >= 1 && id <= 8 &&
-                               ((ignore_mask >> (id - 1)) & 0x1) != 0;
-                    },
+                    [&](uint8_t id) { return ignore.contains(id); },
                     frame_count);
                 command = {};
                 command.control = steer.control;
@@ -138,25 +135,20 @@ int main(int argc, char* argv[]) {
                 command.rad2degree();
                 gimbal.send(command);
                 chain_name = "detecting";
-            } else {
+            } else if (tracker_state == "tracking") {
                 std::optional<auto_aim::Target> target_for_plan =
                     targets.empty() ? std::nullopt : std::make_optional(targets.front());
                 command = planner.plan(target_for_plan, gimbal.bullet_speed());
                 command.small_yaw = command.yaw;
                 command.big_yaw = command.yaw;
                 if (command.control && !targets.empty()) {
-                    const auto& target = targets.front();
-                    const auto ekf_x = target.ekf_x();
+                    const auto ekf_x = targets.front().ekf_x();
                     command.vx = ekf_x[1];
                     command.vy = ekf_x[3];
                     command.distance = std::hypot(ekf_x[0], ekf_x[2]);
-                    if (target.name == auto_aim::ArmorName::OUTPOST) {
-                        command.big_yaw = gimbal_state.big_yaw;
-                    } else {
-                        const double target_yaw = std::atan2(ekf_x[2], ekf_x[0]);
-                        const double yaw_error = tools::limit_rad(target_yaw - gimbal_state.big_yaw);
-                        command.big_yaw = gimbal_state.big_yaw + yaw_error;
-                    }
+                    const double target_yaw = std::atan2(ekf_x[2], ekf_x[0]);
+                    const double yaw_error = tools::limit_rad(target_yaw - gimbal_state.big_yaw);
+                    command.big_yaw = gimbal_state.big_yaw + yaw_error;
                 }
                 command.rad2degree();
 

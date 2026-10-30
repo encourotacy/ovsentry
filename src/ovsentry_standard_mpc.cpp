@@ -102,16 +102,13 @@ int main(int argc, char* argv[]) {
             prev_lost = lost;
 
             if (lost) {
-                const auto ignore_mask = armor_ignore.ignore_ids();
+                const auto ignore = armor_ignore.ignored();
                 const auto steer = omni.update(
                     gimbal_state.big_yaw,
                     [&](std::chrono::steady_clock::time_point t) {
                         return gimbal.big_yaw_at_image(t);
                     },
-                    [&](uint8_t id) {
-                        return id >= 1 && id <= 8 &&
-                               ((ignore_mask >> (id - 1)) & 0x1) != 0;
-                    },
+                    [&](uint8_t id) { return ignore.contains(id); },
                     frame_count);
                 command = {};
                 command.control = steer.control;

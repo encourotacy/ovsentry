@@ -3,8 +3,8 @@
 #include <fastcdr/Cdr.h>
 #include <fastcdr/FastBuffer.h>
 
+#include <algorithm>
 #include <atomic>
-#include <cmath>
 #include <mutex>
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/int32.hpp>
@@ -68,9 +68,9 @@ class ArmorIgnoreSubscriber::Impl {
         if (self_initialized_ && rclcpp::ok()) rclcpp::shutdown();
     }
 
-    size_t ignore_ids() const {
+    ArmorIgnoreList ignored() const {
         std::lock_guard<std::mutex> lock(mutex_);
-        return ignore_ids_;
+        return list_;
     }
 
    private:
@@ -83,19 +83,25 @@ class ArmorIgnoreSubscriber::Impl {
             eprosima::fastcdr::Cdr cdr(buffer);  // 创建 CDR 读取器
             cdr.read_encapsulation();            // 读取 CDR 封装头
 
-            // 读取数据
-            uint8_t ignore_ids = 0;
             uint32_t count = 0;
             cdr >> count;
+            std::vector<uint8_t> ids;
+            ids.reserve(count);
             for (uint32_t i = 0; i < count; ++i) {
                 uint8_t id = 0;
                 cdr >> id;
-                if( id > 0 && id <= 8) ignore_ids += static_cast<uint8_t>(std::pow(2, --id));
+                ids.push_back(id);
             }
+            std::sort(ids.begin(), ids.end());
+            ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
 
             {
                 std::lock_guard<std::mutex> lock(mutex_);
-                ignore_ids_ = ignore_ids;
+                list_.enabled = !ids.empty();
+                list_.ignored_ids = ids;
+            }
+            for (const auto id : ids) {
+                tools::logger()->info("[AutoAimIgnore] ignore armor id: {}", static_cast<int>(id));
             }
         } catch (const std::exception& e) {
             tools::logger()->warn("[AutoAimIgnore] Failed to parse ignore ids: {}", e.what());
@@ -103,7 +109,7 @@ class ArmorIgnoreSubscriber::Impl {
     }
 
     mutable std::mutex mutex_;
-    uint8_t ignore_ids_;
+    ArmorIgnoreList list_;
     bool self_initialized_ = false;
     std::shared_ptr<rclcpp::Node> node_;
     std::shared_ptr<rclcpp::GenericSubscription> subscription_;
@@ -111,7 +117,7 @@ class ArmorIgnoreSubscriber::Impl {
     std::thread spin_thread_;
 };
 
-uint8_t ArmorIgnoreSubscriber::ignore_ids() const { return impl_->ignore_ids(); }
+ArmorIgnoreList ArmorIgnoreSubscriber::ignored() const { return impl_->ignored(); }
 
 //=== State ===
 class StateSubscriber::Impl {
